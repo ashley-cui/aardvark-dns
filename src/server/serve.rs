@@ -8,7 +8,8 @@ use crate::error::AardvarkErrorList;
 use crate::error::AardvarkResult;
 use crate::error::AardvarkWrap;
 use arc_swap::ArcSwap;
-use log::{debug, error, info};
+use inotify::{Inotify, WatchMask};
+use log::{debug, error, info, warn};
 use nix::unistd::{self, dup2_stderr, dup2_stdin, dup2_stdout};
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -81,6 +82,15 @@ pub async fn serve(
         no_proxy,
     )
     .await?;
+
+    // Start monitoring /etc/resolv.conf for changes
+    let nameservers_monitor = nameservers.clone();
+    tokio::spawn(async move {
+        if let Err(e) = monitor_resolv_conf(nameservers_monitor).await {
+            error!("resolv.conf monitoring failed: {}", e);
+        }
+    });
+
     // We are ready now, this is far from perfect we should at least wait for the first bind
     // to work but this is not really possible with the current code flow and needs more changes.
     daemonize()?;
@@ -363,6 +373,46 @@ fn daemonize() -> Result<(), Error> {
     let _ = dup2_stdout(&dev_null);
     let _ = dup2_stderr(&dev_null);
     Ok(())
+}
+
+/// Monitor /etc/resolv.conf for changes using inotify and update nameservers
+async fn monitor_resolv_conf(nameservers: Arc<Mutex<Vec<SocketAddr>>>) -> AardvarkResult<()> {
+    let mut inotify = Inotify::init().wrap("failed to initialize inotify")?;
+
+    // Watch for modify and close_write events on /etc/resolv.conf
+    // We use close_write to avoid reacting to every partial write during file updates
+    inotify
+        .watches()
+        .add("/etc/resolv.conf", WatchMask::MODIFY | WatchMask::CLOSE_WRITE)
+        .wrap("failed to add inotify watch for /etc/resolv.conf")?;
+
+    info!("Started monitoring /etc/resolv.conf for changes");
+
+    let mut buffer = [0; 1024];
+    loop {
+        // This will block until events are available
+        let events = inotify
+            .read_events_blocking(&mut buffer)
+            .wrap("failed to read inotify events")?;
+
+        for event in events {
+            debug!("Received inotify event for /etc/resolv.conf: {:?}", event.mask);
+
+            // Read the updated resolv.conf and update nameservers
+            match get_upstream_resolvers() {
+                Ok(new_nameservers) => {
+                    let mut ns_guard = nameservers.lock().expect("lock nameservers");
+                    if *ns_guard != new_nameservers {
+                        info!("Updated upstream nameservers: {:?}", new_nameservers);
+                        *ns_guard = new_nameservers;
+                    }
+                }
+                Err(err) => {
+                    warn!("Failed to reload upstream nameservers after /etc/resolv.conf change: {}", err);
+                }
+            }
+        }
+    }
 }
 
 // read /etc/resolv.conf and return all nameservers
