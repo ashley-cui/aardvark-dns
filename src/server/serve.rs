@@ -30,6 +30,10 @@ use std::fs::File;
 use std::io::prelude::*;
 use std::path::Path;
 use std::process;
+use inotify::{Inotify, WatchMask};
+use futures::StreamExt;
+
+const RESOLV_CONF: &str = "/etc/resolv.conf";
 
 type ThreadHandleMap<Ip> =
     HashMap<(String, Ip), (flume::Sender<()>, JoinHandle<AardvarkResult<()>>)>;
@@ -88,27 +92,72 @@ pub async fn serve(
     unistd::write(&ready, &msg)?;
     drop(ready);
 
-    loop {
-        // Block until we receive a SIGHUP.
-        signals.recv().await;
-        debug!("Received SIGHUP");
-        if let Err(e) = read_config_and_spawn(
-            config_path,
-            port,
-            filter_search_domain,
-            &mut handles_v4,
-            &mut handles_v6,
-            nameservers.clone(),
-            no_proxy,
-        )
-        .await
-        {
-            // do not exit here, we just keep running even if something failed
-            error!("{e}");
-        };
+    // Setup inotify to monitor resolv.conf
+    let mut buffer = [0; 1024];
+    let mut event_stream = None;
+    if let Ok(inotify) = Inotify::init(){
+        if let Err(e) = inotify.watches().add(
+            RESOLV_CONF,
+            WatchMask::CLOSE_WRITE | WatchMask::MOVED_TO,
+        ){
+            error!("Failed to add watch on /etc/resolv.conf. Nameservers will not be updated on resolv.conf change: {e}");
+        } else {
+            match inotify.into_event_stream(&mut buffer) {
+                Ok(stream) => event_stream = Some(stream),
+                Err(e) => error!("Failed to stream inotify events. Nameservers will not be updated on resolv.conf change: {e}"),
+            }
+        }
+    } else{
+        error!("Failed to initialize inotify. Nameservers will not be updated on resolv.conf change");
     }
-}
 
+    loop{
+        tokio::select! {
+            // Block until we receive a SIGHUP.
+            _= signals.recv()=>{
+                debug!("Received SIGHUP");
+                if let Err(e) = read_config_and_spawn(
+                    config_path,
+                    port,
+                    filter_search_domain,
+                    &mut handles_v4,
+                    &mut handles_v6,
+                    nameservers.clone(),
+                    no_proxy,
+                )
+                .await
+                {
+                    // do not exit here, we just keep running even if something failed
+                    error!("{e}");
+                };
+            }
+            // Block until resolv.conf is changed, monitored via inotify. Then reload nameservers
+            _ = async {
+                if let Some(ref mut stream) = event_stream {
+                    stream.next().await
+                } else {
+                    // If inotify setup failed, then block this branch of tokio select forever
+                    futures::future::pending().await
+                }
+            } => {
+                let upstream_resolvers = match get_upstream_resolvers() {
+                    Ok(ns) => ns,
+                    Err(err) => {
+                        error!("Failed to reload nameservers on change: {err}");
+                        continue;
+                    }
+                };
+                match nameservers.lock() {
+                    Ok(mut ns) => *ns = upstream_resolvers,
+                    Err(err) => {
+                        error!("Failed to reload nameservers, could not obtain lock: {err}");
+                    }
+                }
+            }
+        }
+    }
+
+}
 /// # Ensure the expected DNS server threads are running
 ///
 /// Stop threads corresponding to listen IPs no longer in the configuration and start threads
@@ -367,7 +416,7 @@ fn daemonize() -> Result<(), Error> {
 
 // read /etc/resolv.conf and return all nameservers
 fn get_upstream_resolvers() -> AardvarkResult<Vec<SocketAddr>> {
-    let mut f = File::open("/etc/resolv.conf").wrap("open resolv.conf")?;
+    let mut f = File::open(RESOLV_CONF).wrap("open resolv.conf")?;
     let mut buf = String::with_capacity(4096);
     f.read_to_string(&mut buf).wrap("read resolv.conf")?;
 
