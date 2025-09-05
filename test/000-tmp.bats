@@ -48,56 +48,47 @@ function teardown() {
 	run_in_host_netns dnsmasq --conf-file=/dev/null --pid-file="$AARDVARK_TMPDIR/dnsmasq_second.pid" \
 		--except-interface=lo --listen-address=127.1.1.2 --bind-interfaces \
 		--address=/second-server.test/192.168.100.2 --no-resolv --no-hosts
-	SECOND_DNS_PID=$(cat $AARDVARK_TMPDIR/dnsmasq_second.pid)
+	SHELPER_PID=$(cat $AARDVARK_TMPDIR/dnsmasq_second.pid)
 
-	# Create initial resolv.conf pointing to first DNS server
-	cat > "$AARDVARK_TMPDIR/resolv.conf" <<EOF
-nameserver 127.1.1.1
-EOF
+# 	# Create initial resolv.conf pointing to first DNS server
+# 	cat > "$AARDVARK_TMPDIR/resolv.conf" <<EOF
+# nameserver 127.1.1.1
+# EOF
 
-	# Bind mount our custom resolv.conf
-	run_in_host_netns mount --bind "$AARDVARK_TMPDIR/resolv.conf" /etc/resolv.conf
+	# # Bind mount our custom resolv.conf
+	# run_in_host_netns mount --bind "$AARDVARK_TMPDIR/resolv.conf" /etc/resolv.conf
 
 	# Set up container
 	subnet_a=$(random_subnet 5)
-	create_config network_name="podman1" container_id=$(random_string 64) container_name="testcontainer" subnet="$subnet_a"
+	create_config network_name="podman1" container_id=$(random_string 64) container_name="aone" subnet="$subnet_a"
 	config_a1=$config
 	gw=$(echo "$config_a1" | jq -r .network_info.podman1.subnets[0].gateway)
 	create_container "$config_a1"
 	a1_pid=$CONTAINER_NS_PID
 
-	# Give aardvark some time to start and read initial resolv.conf
-	sleep 2
 
 	# Test that we can resolve using the first DNS server
-	run_in_container_netns "$a1_pid" "dig" "+short" "first-server.test" "@$gw"
-	assert "$output" == "192.168.100.1" "should resolve using first DNS server"
+	run_in_container_netns "$a1_pid" "dig" "+short" "testname" "@$gw"
+	assert "$output" == "198.51.100.1" "should resolve using first DNS server"
 
 	# Verify we cannot resolve second server's domain yet
 	expected_rc=1 run_in_container_netns "$a1_pid" "host" "-t" "a" "second-server.test" "$gw"
 	assert "$output" =~ "not found" "should not resolve second server's domain initially"
 
-# 	# Update resolv.conf to point to second DNS server
-# 	cat > "$AARDVARK_TMPDIR/resolv.conf" <<EOF
-# nameserver 127.1.1.2
-# EOF
+	# Update resolv.conf to point to second DNS server
+	cat > "$AARDVARK_TMPDIR/resolv.conf" <<EOF
+nameserver 127.1.1.2
+EOF
 
 # 	# Give aardvark time to detect the change and update nameservers
-# 	sleep 3
+	sleep 3
 
-# 	# Test that we can now resolve using the second DNS server
-# 	run_in_container_netns "$a1_pid" "dig" "+short" "second-server.test" "@$gw"
-# 	assert "$output" == "192.168.100.2" "should resolve using second DNS server after resolv.conf change"
+	# Test that we can now resolve using the second DNS server
+	run_in_container_netns "$a1_pid" "dig" "+short" "second-server.test" "@$gw"
+	assert "$output" == "192.168.100.2" "should resolve using second DNS server after resolv.conf change"
 
 # 	# Verify we cannot resolve first server's domain anymore
 # 	expected_rc=1 run_in_container_netns "$a1_pid" "host" "-t" "a" "first-server.test" "$gw"
 # 	assert "$output" =~ "not found" "should not resolve first server's domain after change"
 
-	# Clean up
-	if [[ -n "$FIRST_DNS_PID" ]]; then
-		kill -9 $FIRST_DNS_PID
-	fi
-	if [[ -n "$SECOND_DNS_PID" ]]; then
-		kill -9 $SECOND_DNS_PID
-	fi
 }
