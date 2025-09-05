@@ -8,6 +8,7 @@ use crate::error::AardvarkErrorList;
 use crate::error::AardvarkResult;
 use crate::error::AardvarkWrap;
 use arc_swap::ArcSwap;
+use log::warn;
 use log::{debug, error, info};
 use nix::unistd::{self, dup2_stderr, dup2_stdin, dup2_stdout};
 use std::collections::HashMap;
@@ -30,6 +31,7 @@ use std::fs::File;
 use std::io::prelude::*;
 use std::path::Path;
 use std::process;
+use inotify::{Inotify, WatchMask};
 
 type ThreadHandleMap<Ip> =
     HashMap<(String, Ip), (flume::Sender<()>, JoinHandle<AardvarkResult<()>>)>;
@@ -176,7 +178,9 @@ where
                 continue;
             }
         };
-
+        // tokio::spawn(print_nameservers(nameservers.clone()));
+        // tokio::spawn(update_nameservers(nameservers.clone()));
+        tokio::spawn(monitor_upstream_resolvers(nameservers.clone()));
         let handle = tokio::spawn(async move {
             start_dns_server(
                 network_name_,
@@ -345,6 +349,57 @@ async fn read_config_and_spawn(
     }
 
     Err(AardvarkError::List(errors))
+}
+// async fn update_nameservers(nameservers: Arc<Mutex<Vec<SocketAddr>>>){
+//     let mut ns = Vec::new();
+//     ns.push(SocketAddr::new("123.123.123.123".parse().unwrap(), DNS_PORT));
+//     *nameservers.lock().expect("lock nameservers") = ns;
+//     log::debug!("Updated nameservers");
+// }
+// async fn print_nameservers(nameservers: Arc<Mutex<Vec<SocketAddr>>>){
+//     let mut cont: i32 = 0;
+//     loop{
+//         {
+//         let ns = nameservers.lock().expect("lock nameservers");
+//         log::debug!("{:?} {}",ns, cont);
+//         cont+=1;
+//         }
+//         sleep(Duration::from_secs(5)).await;
+//     }
+// }
+
+async fn monitor_upstream_resolvers(nameservers: Arc<Mutex<Vec<SocketAddr>>>) {
+    let mut inotify = match Inotify::init() {
+        Ok(inotify) => inotify,
+        Err(err) => {
+            warn!("Failed to initialize inotify: {err}");
+            return;
+        }
+    };
+    inotify
+        .watches()
+        .add(
+            "/etc/resolv.conf",
+            WatchMask::MODIFY,
+        );
+        let mut buffer = [0; 1024];
+        loop{
+            let events = inotify.read_events_blocking(&mut buffer)
+                .expect("Error while reading events");
+
+            for _ in events {
+                let upstream_resolvers = match get_upstream_resolvers() {
+                    Ok(ns) => ns,
+                    Err(err) => {
+                        error!("Failed to reload nameservers on change: {err}");
+                        continue;
+                    }
+                };
+                {
+                    *nameservers.lock().expect("lock nameservers") = upstream_resolvers;
+                }
+            }
+        }
 }
 
 // creates new session and put /dev/null on the stdio streams
